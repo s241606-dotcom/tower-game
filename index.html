@@ -1,0 +1,441 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>達達特工 - 塔防遊戲</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.2/p5.min.js"></script>
+  <style>
+    body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background: #1a1a2e; font-family: Arial, sans-serif; }
+    canvas { border: 2px solid #16213e; border-radius: 10px; }
+    #ui { position: absolute; top: 10px; right: 10px; background: rgba(26, 26, 46, 0.9); padding: 15px; border-radius: 10px; color: white; }
+    button { margin: 5px; padding: 8px 12px; background: #0f3460; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    button:hover { background: #533483; }
+    #towerOptions { display: none; }
+  </style>
+</head>
+<body>
+<div id="ui">
+  <h3>達達特工基地</h3>
+  <button id="startPause">開始任務</button>
+  <button id="toggleTowers">塔選擇</button>
+  <div id="towerOptions">
+    <button id="normalTower">偵察塔 (50)</button>
+    <button id="slowTower">干擾塔 (75)</button>
+    <button id="blastTower">爆破塔 (100)</button>
+    <button id="laserTower">雷射塔 (150)</button>
+    <button id="cancel">取消</button>
+  </div>
+</div>
+<script>
+let enemies = [];
+let towers = [];
+let path;
+let money = 200;
+let lives = 50; // 初始生命
+const MAX_LIVES = 100; // 生命上限
+let wave = 0;
+let enemiesToSpawn = 0;
+let spawnTimer = 0;
+let gamePaused = true;
+let selectedTowerType = null;
+let towerOptionsVisible = false;
+let movingTower = null;
+let previewPos = null;
+let lifeTimer = 0;
+let isBossWave = false;
+
+function setup() {
+  createCanvas(800, 600);
+  path = [
+    { x: 0, y: 150 },
+    { x: 250, y: 150 },
+    { x: 250, y: 350 },
+    { x: 500, y: 350 },
+    { x: 500, y: 500 },
+    { x: 700, y: 500 },
+    { x: 700, y: 100 },
+    { x: 800, y: 100 }
+  ];
+  // UI buttons
+  select('#startPause').mousePressed(togglePause);
+  select('#toggleTowers').mousePressed(toggleTowerOptions);
+  select('#normalTower').mousePressed(() => { selectedTowerType = 'normal'; previewPos = createVector(width / 2, height / 2); });
+  select('#slowTower').mousePressed(() => { selectedTowerType = 'slow'; previewPos = createVector(width / 2, height / 2); });
+  select('#blastTower').mousePressed(() => { selectedTowerType = 'blast'; previewPos = createVector(width / 2, height / 2); });
+  select('#laserTower').mousePressed(() => { selectedTowerType = 'laser'; previewPos = createVector(width / 2, height / 2); });
+  select('#cancel').mousePressed(() => { selectedTowerType = null; movingTower = null; previewPos = null; });
+}
+
+function draw() {
+  background(26, 26, 46);
+  // Draw path
+  stroke(255, 215, 0);
+  strokeWeight(12);
+  noFill();
+  beginShape();
+  for (let point of path) {
+    vertex(point.x, point.y);
+  }
+  endShape();
+  strokeWeight(1);
+  
+  if (gamePaused && wave === 0) {
+    fill(255, 215, 0);
+    textSize(32);
+    textAlign(CENTER);
+    text("歡迎來到達達特工！", width / 2, height / 2);
+    textSize(18);
+    text("點擊 '開始任務' 展開行動！", width / 2, height / 2 + 40);
+    return;
+  }
+  
+  if (gamePaused) return;
+  
+  // 每秒 +1 生命（有上限）
+  if (!gamePaused && lives < MAX_LIVES) {
+    lifeTimer++;
+    if (lifeTimer >= 60) {
+      lives = min(lives + 1, MAX_LIVES);
+      lifeTimer = 0;
+    }
+  }
+  
+  // Spawn enemies
+  if (enemiesToSpawn > 0 && spawnTimer <= 0) {
+    enemies.push(new Enemy(wave, isBossWave));
+    enemiesToSpawn--;
+    spawnTimer = 30;
+  } else if (spawnTimer > 0) {
+    spawnTimer--;
+  }
+  
+  // Update enemies
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    enemies[i].update();
+    enemies[i].show();
+    if (enemies[i].offScreen()) {
+      lives--;
+      enemies.splice(i, 1);
+    }
+  }
+  
+  // Update towers
+  for (let tower of towers) {
+    tower.show();
+    tower.attack();
+  }
+  
+  // Handle tower preview
+  if (selectedTowerType || movingTower) {
+    if (!previewPos) previewPos = createVector(width / 2, height / 2);
+    let moveSpeed = 5;
+    if (keyIsDown(UP_ARROW) || keyIsDown(87)) previewPos.y -= moveSpeed;
+    if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) previewPos.y += moveSpeed;
+    if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) previewPos.x -= moveSpeed;
+    if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) previewPos.x += moveSpeed;
+    previewPos.x = constrain(previewPos.x, 15, width - 15);
+    previewPos.y = constrain(previewPos.y, 15, height - 15);
+    
+    let previewType = selectedTowerType || movingTower.type;
+    push();
+    fill(previewType === 'normal' ? color(0, 191, 255, 150) : 
+         previewType === 'slow' ? color(0, 255, 127, 150) : 
+         previewType === 'blast' ? color(186, 85, 211, 150) : color(255, 69, 0, 150));
+    ellipse(previewPos.x, previewPos.y, 30, 30);
+    noFill();
+    stroke(previewType === 'normal' ? color(0, 191, 255, 100) : 
+           previewType === 'slow' ? color(0, 255, 127, 100) : 
+           previewType === 'blast' ? color(186, 85, 211, 100) : color(255, 69, 0, 100));
+    ellipse(previewPos.x, previewPos.y, (previewType === 'normal' ? 100 : previewType === 'slow' ? 110 : previewType === 'blast' ? 110 : 90) * 2);
+    stroke(255);
+    pop();
+    fill(255);
+    textSize(16);
+    textAlign(CENTER);
+    text(selectedTowerType ? "放置模式：WASD移動，Enter放置" : "移動模式：WASD移動，Enter確認", width / 2, 30);
+  }
+  
+  // 左下角狀態顯示
+  fill(255);
+  textSize(20);
+  textAlign(LEFT);
+  text(`金幣: ${money}`, 10, height - 90);
+  text(`生命: ${lives}/${MAX_LIVES}`, 10, height - 60); // 顯示上限
+  text(`波次: ${wave}`, 10, height - 30);
+  
+  // 下一波
+  if (enemies.length === 0 && enemiesToSpawn === 0 && !gamePaused) {
+    wave++;
+    isBossWave = (wave % 10 === 0);
+    enemiesToSpawn = isBossWave ? 1 : 5 + wave * 2;
+    spawnTimer = 60;
+  }
+  
+  // 遊戲結束
+  if (lives <= 0) {
+    fill(255, 0, 0);
+    textSize(40);
+    textAlign(CENTER);
+    text("任務失敗！", width / 2, height / 2);
+    textSize(20);
+    text("特工達達已被捕獲...", width / 2, height / 2 + 40);
+    noLoop();
+  }
+}
+
+function mousePressed() {
+  if (gamePaused) return;
+  for (let tower of towers) {
+    if (dist(mouseX, mouseY, tower.pos.x, tower.pos.y) < 15 && !selectedTowerType && !movingTower) {
+      if (keyIsDown(SHIFT)) {
+        movingTower = tower;
+        previewPos = createVector(tower.pos.x, tower.pos.y);
+        return;
+      } else if (money >= tower.upgradeCost) {
+        tower.upgrade();
+        money -= tower.upgradeCost;
+        return;
+      }
+    }
+  }
+}
+
+function keyPressed() {
+  if (gamePaused) return;
+  if (keyCode === ENTER && (selectedTowerType || movingTower) && !isOnPath(previewPos.x, previewPos.y)) {
+    if (selectedTowerType === 'normal' && money >= 50) {
+      towers.push(new Tower(previewPos.x, previewPos.y, 'normal'));
+      money -= 50;
+      selectedTowerType = null;
+      previewPos = null;
+    } else if (selectedTowerType === 'slow' && money >= 75) {
+      towers.push(new Tower(previewPos.x, previewPos.y, 'slow'));
+      money -= 75;
+      selectedTowerType = null;
+      previewPos = null;
+    } else if (selectedTowerType === 'blast' && money >= 100) {
+      towers.push(new Tower(previewPos.x, previewPos.y, 'blast'));
+      money -= 100;
+      selectedTowerType = null;
+      previewPos = null;
+    } else if (selectedTowerType === 'laser' && money >= 150) {
+      towers.push(new Tower(previewPos.x, previewPos.y, 'laser'));
+      money -= 150;
+      selectedTowerType = null;
+      previewPos = null;
+    } else if (movingTower) {
+      movingTower.pos.x = previewPos.x;
+      movingTower.pos.y = previewPos.y;
+      movingTower = null;
+      previewPos = null;
+    }
+  }
+}
+
+function isOnPath(x, y) {
+  for (let i = 0; i < path.length - 1; i++) {
+    let p1 = path[i];
+    let p2 = path[i + 1];
+    let d = distToSegment(x, y, p1.x, p1.y, p2.x, p2.y);
+    if (d < 30) return true;
+  }
+  return false;
+}
+
+function distToSegment(px, py, x1, y1, x2, y2) {
+  let dx = x2 - x1;
+  let dy = y2 - y1;
+  let lenSquared = dx * dx + dy * dy;
+  if (lenSquared === 0) return dist(px, py, x1, y1);
+  let t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / lenSquared));
+  let projX = x1 + t * dx;
+  let projY = y1 + t * dy;
+  return dist(px, py, projX, projY);
+}
+
+function togglePause() {
+  gamePaused = !gamePaused;
+  select('#startPause').html(gamePaused ? '開始任務' : '暫停行動');
+  if (!gamePaused && wave === 0) {
+    wave = 1;
+    enemiesToSpawn = 5;
+    isBossWave = false;
+  }
+}
+
+function toggleTowerOptions() {
+  towerOptionsVisible = !towerOptionsVisible;
+  select('#towerOptions').style('display', towerOptionsVisible ? 'block' : 'none');
+  select('#toggleTowers').html(towerOptionsVisible ? '隱藏塔' : '塔選擇');
+}
+
+class Enemy {
+  constructor(wave, isBoss = false) {
+    this.pos = createVector(path[0].x, path[0].y);
+    this.targetIndex = 1;
+    this.isBoss = isBoss;
+    this.baseSpeed = (2 + wave * 0.2) * 0.5 * (isBoss ? 0.5 : 1);
+    this.speed = this.baseSpeed;
+    this.health = isBoss ? 3000 + wave * 300 : 150; // 普通敵人固定150
+    this.slowTimer = 0;
+  }
+  
+  update() {
+    if (this.slowTimer > 0) {
+      this.speed = this.baseSpeed * 0.5;
+      this.slowTimer--;
+    } else {
+      this.speed = this.baseSpeed;
+    }
+    
+    let target = path[this.targetIndex];
+    let direction = createVector(target.x - this.pos.x, target.y - this.pos.y);
+    direction.setMag(this.speed);
+    this.pos.add(direction);
+    
+    if (dist(this.pos.x, this.pos.y, target.x, target.y) < 5) {
+      this.targetIndex++;
+    }
+  }
+  
+  show() {
+    fill(this.slowTimer > 0 ? color(255, 165, 0) : this.isBoss ? color(139, 0, 0) : color(255, 20, 147));
+    ellipse(this.pos.x, this.pos.y, this.isBoss ? 40 : 20, this.isBoss ? 40 : 20);
+    // 血條
+    fill(255, 0, 0);
+    rect(this.pos.x - (this.isBoss ? 20 : 10), this.pos.y - (this.isBoss ? 35 : 25), this.isBoss ? 40 : 20, 5);
+    fill(0, 255, 0);
+    let maxHealth = this.isBoss ? 3000 + wave * 300 : 150;
+    rect(this.pos.x - (this.isBoss ? 20 : 10), this.pos.y - (this.isBoss ? 35 : 25), (this.isBoss ? 40 : 20) * (this.health / maxHealth), 5);
+  }
+  
+  offScreen() {
+    return this.targetIndex >= path.length;
+  }
+  
+  hit(damage) {
+    this.health -= damage;
+    if (this.health <= 0) {
+      let index = enemies.indexOf(this);
+      if (index > -1) {
+        enemies.splice(index, 1);
+        money += this.isBoss ? 75 + wave * 15 : 15 + wave * 3;
+      }
+    }
+  }
+  
+  slow() {
+    this.slowTimer = 180;
+  }
+}
+
+class Tower {
+  constructor(x, y, type) {
+    this.pos = createVector(x, y);
+    this.type = type;
+    this.level = 1;
+    this.range = type === 'normal' ? 100 : type === 'slow' ? 110 : type === 'blast' ? 110 : 90;
+    this.damage = type === 'normal' ? 15 : type === 'slow' ? 10 : type === 'blast' ? 18 : 25;
+    this.fireRate = type === 'normal' ? 36 : type === 'slow' ? 60 : type === 'blast' ? 108 : 90;
+    this.timer = 0;
+    this.upgradeCost = type === 'normal' ? 30 : type === 'slow' ? 45 : type === 'blast' ? 40 : 50;
+  }
+  
+  show() {
+    fill(this.type === 'normal' ? color(0, 191, 255) : 
+         this.type === 'slow' ? color(0, 255, 127) : 
+         this.type === 'blast' ? color(186, 85, 211) : color(255, 69, 0));
+    ellipse(this.pos.x, this.pos.y, 30, 30);
+    fill(139, 69, 19);
+    rect(this.pos.x - 15, this.pos.y + 10, 30, 10);
+    noFill();
+    stroke(this.type === 'normal' ? color(0, 191, 255, 100) : 
+           this.type === 'slow' ? color(0, 255, 127, 100) : 
+           this.type === 'blast' ? color(186, 85, 211, 100) : color(255, 69, 0, 100));
+    ellipse(this.pos.x, this.pos.y, this.range * 2);
+    stroke(255);
+    fill(255);
+    textSize(12);
+    textAlign(CENTER);
+    text(`Lv${this.level}`, this.pos.x, this.pos.y - 10);
+  }
+  
+  attack() {
+    if (this.timer <= 0) {
+      if (this.type === 'normal') {
+        // 偵察塔：單體攻擊最近敵人
+        let closest = null;
+        let minDist = this.range;
+        for (let enemy of enemies) {
+          let d = dist(this.pos.x, this.pos.y, enemy.pos.x, enemy.pos.y);
+          if (d < minDist) {
+            minDist = d;
+            closest = enemy;
+          }
+        }
+        if (closest) closest.hit(this.damage);
+      } else {
+        // 其他塔：群體攻擊
+        for (let enemy of enemies) {
+          let d = dist(this.pos.x, this.pos.y, enemy.pos.x, enemy.pos.y);
+          if (d < this.range) {
+            if (this.type === 'slow') enemy.slow();
+            enemy.hit(this.damage);
+          }
+        }
+      }
+      this.timer = this.fireRate;
+    } else {
+      this.timer--;
+    }
+  }
+  
+  upgrade() {
+    this.level++;
+    this.range += 10;
+    this.damage += this.type === 'normal' ? 8 : this.type === 'slow' ? 5 : this.type === 'blast' ? 6 : 10;
+    this.upgradeCost += this.type === 'normal' ? 20 : this.type === 'slow' ? 30 : this.type === 'blast' ? 40 : 50;
+  }
+}
+</script>
+</body>
+</html>
